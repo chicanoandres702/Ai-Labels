@@ -6,6 +6,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.cloud import firestore
 from google.cloud import pubsub_v1
+from google.cloud import secretmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -15,38 +16,39 @@ app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', os.urandom(24))
 
 # Configuration
-PROJECT_ID = "gmail-labels-421404"  # Your project ID
+PROJECT_ID = "gmail-labels-421404"
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.labels'
 ]
 
-# Initialize Firestore
+# Initialize clients
 db = firestore.Client()
+secrets_client = secretmanager.SecretManagerServiceClient()
 
-def setup_gmail_watch(service, user_email):
-    """Setup Gmail push notifications"""
+def get_oauth_config():
+    """Get OAuth configuration from Secret Manager"""
     try:
-        request = {
-            'labelIds': ['INBOX'],
-            'topicName': f'projects/{PROJECT_ID}/topics/gmail-notifications'
-        }
-        
-        response = service.users().watch(userId='me', body=request).execute()
-        logger.info(f"Watch response: {response}")
-        
-        # Store watch details in Firestore
-        user_ref = db.collection('users').document(user_email)
-        user_ref.update({
-            'watch_details': response,
-            'watch_status': 'active'
-        })
-        
-        return True
+        name = f"projects/{PROJECT_ID}/secrets/oauth-client-config/versions/latest"
+        response = secrets_client.access_secret_version(request={"name": name})
+        return json.loads(response.payload.data.decode("UTF-8"))
     except Exception as e:
-        logger.error(f"Watch setup error: {e}")
-        return False
+        logger.error(f"Error getting OAuth config: {e}")
+        return None
+
+def create_oauth_flow(redirect_uri):
+    """Create OAuth flow using config from Secret Manager"""
+    client_config = get_oauth_config()
+    if not client_config:
+        raise ValueError("OAuth configuration not found")
+
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        redirect_uri=redirect_uri
+    )
+    return flow
 
 @app.route('/')
 def index():
@@ -56,28 +58,27 @@ def index():
 
 @app.route('/authorize')
 def authorize():
-    flow = Flow.from_client_secrets_file(
-        'client_secret.json',
-        scopes=SCOPES,
-        redirect_uri=url_for('oauth2callback', _external=True)
-    )
-    authorization_url, state = flow.authorization_url(
-        access_type='offline',
-        include_granted_scopes='true'
-    )
-    session['state'] = state
-    return redirect(authorization_url)
+    try:
+        redirect_uri = url_for('oauth2callback', _external=True)
+        flow = create_oauth_flow(redirect_uri)
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true'
+        )
+        session['state'] = state
+        return redirect(authorization_url)
+    except Exception as e:
+        logger.error(f"Authorization error: {e}")
+        return f"Authorization failed: {str(e)}", 500
 
 @app.route('/oauth2callback')
 def oauth2callback():
     try:
-        flow = Flow.from_client_secrets_file(
-            'client_secret.json',
-            scopes=SCOPES,
-            state=session['state'],
-            redirect_uri=url_for('oauth2callback', _external=True)
-        )
+        if 'state' not in session:
+            return 'State missing from session', 400
         
+        redirect_uri = url_for('oauth2callback', _external=True)
+        flow = create_oauth_flow(redirect_uri)
         flow.fetch_token(authorization_response=request.url)
         credentials = flow.credentials
         
@@ -103,15 +104,11 @@ def oauth2callback():
             }
         })
         
-        # Setup watch
-        if setup_gmail_watch(service, email):
-            return redirect(url_for('index'))
-        else:
-            return 'Watch setup failed. Check logs for details.'
+        return redirect(url_for('index'))
             
     except Exception as e:
         logger.error(f"OAuth callback error: {e}")
-        return f'Error: {str(e)}'
+        return f'Error: {str(e)}', 500
 
 @app.route('/logout')
 def logout():
