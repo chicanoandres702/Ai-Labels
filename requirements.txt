@@ -5,4 +5,5 @@ google-auth-httplib2
 google-api-python-client
 google-cloud-firestore
 google-cloud-pubsub
+google-cloud-secret-manager
 gunicorn
